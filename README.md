@@ -1,8 +1,10 @@
 # Looped OPSD
 
-SFT and depth-based on-policy self-distillation (OPSD), using recurrent TinyLlama from the model family introduced in [Teaching Pretrained Language Models to Think Deeper with Retrofitted Recurrence](https://arxiv.org/abs/2511.07384).
+Recurrent depth-based on-policy self-distillation (OPSD), using recurrent TinyLlama from the model family introduced in [Teaching Pretrained Language Models to Think Deeper with Retrofitted Recurrence](https://arxiv.org/abs/2511.07384).
 
 [Article: Boosting On-Policy Self-Distillation](https://anantg.xyz/writing/boosting-on-policy-self-distillation/)
+
+Read the article above! Reach out if you think this is cool.
 
 | Config (`configs/`) | Runner (`python -m …`) |
 | --- | --- |
