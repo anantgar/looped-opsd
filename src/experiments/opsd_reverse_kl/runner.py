@@ -8,13 +8,13 @@ from phase_timing import PhaseTimes
 
 TIMES = PhaseTimes()
 from experiments.common.rollouts import pack_rollouts, forward_kl
-from experiments.opd_reverse_kl.loss import backward_opd, backward_reference
+from experiments.opsd_reverse_kl.loss import backward_opsd, backward_reference
 from experiments.common.native import (
     NativeForward,
     collect_sampled_rollout,
 )
 from experiments.common.gradient_diagnostics import ComponentSnapshot
-from experiments.opd_sampled_preservation.schedule import shallow_jobs_for_update
+from experiments.opsd_sampled_preservation.schedule import shallow_jobs_for_update
 import recovery
 from native_recurrent import NativeReadout, prepare_data
 from train import seed_all, batch_tensors, eval_nll
@@ -176,7 +176,7 @@ def gate(args, cfg, output):
         for depth in depths:
             stress, state = stress_batches[depth]
             target = teacher_target(teacher, stress, state, 4, amp)
-            backward_opd(
+            backward_opsd(
                 fwd,
                 target,
                 stress,
@@ -193,7 +193,7 @@ def gate(args, cfg, output):
         probe.capture()
         stress, state = stress_batches[4]
         target = teacher_target(teacher, stress, state, 4, amp)
-        backward_opd(
+        backward_opsd(
             fwd,
             target,
             stress,
@@ -253,7 +253,7 @@ def run(args, cfg, out):
     assert cfg["student_depth_sampling"] == "uniform-once-per-optimizer-update"
     assert cfg["shallow_loss_weights"] == {"1": 1 / 3, "2": 1 / 3, "3": 1 / 3}
     assert cfg["preservation_weight"] == 1 and cfg["reference_ce_weight"] == 0
-    assert cfg["opd_weight"] == 1.0
+    assert cfg["opsd_weight"] == 1.0
     assert not cfg["teacher_privileged_context"]
     assert cfg["optimizer"] == "adamw8" and cfg["eval_depths"] == [1, 2, 4]
     gate_record = json.load(open(args.gate))
@@ -380,9 +380,9 @@ def run(args, cfg, out):
         import wandb
 
         tracker = wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "depth-opd"),
+            project=os.environ.get("WANDB_PROJECT", "looped-opsd"),
             entity=os.environ.get("WANDB_ENTITY"),
-            group="GSM8K/OPD-sampled123-reverseKL",
+            group="GSM8K/OPSD-sampled123-reverseKL",
             name=cfg["run_id"],
             config=cfg,
             id=progress.get("wandb_id"),
@@ -608,7 +608,7 @@ def run(args, cfg, out):
                         [r.prefix], [r.completion], eos=eos, pad=eos, device="cuda"
                     )
                     target = teacher_target(teacher, packed, r.initial_state, 4, amp)
-                    stats = backward_opd(
+                    stats = backward_opsd(
                         fwd,
                         target,
                         packed,
@@ -629,7 +629,7 @@ def run(args, cfg, out):
                                 "completion_tokens": r.completion,
                                 "ended": r.ended,
                                 "student_depth": depth,
-                                "family": "shallow_opd",
+                                "family": "shallow_opsd",
                             }
                         )
                         + "\n"
@@ -646,7 +646,7 @@ def run(args, cfg, out):
                         target = teacher_target(
                             teacher, packed, r.initial_state, 4, amp
                         )
-                        stats = backward_opd(
+                        stats = backward_opsd(
                             fwd,
                             target,
                             packed,
@@ -724,7 +724,7 @@ def run(args, cfg, out):
                     "train_step_seconds": time.perf_counter() - step_started,
                     **TIMES.step,
                     "step": step,
-                    "opd_loss": totals["kl_sequence_mean_sum"] / len(shallow_jobs),
+                    "opsd_loss": totals["kl_sequence_mean_sum"] / len(shallow_jobs),
                     "reference_ce": totals["reference_ce_sum"]
                     / max(1, totals["reference_tokens"]),
                     "gradient_norm": float(norm),

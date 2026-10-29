@@ -1,12 +1,13 @@
-"""Frozen D1/D4 preservation and matched SFT4 continuations; native execution."""
+"""Frozen D4 to one sampled intermediate depth per update, plus frozen D4 anchor."""
 import argparse, contextlib, datetime as dt, hashlib, json, math, os, random
 import signal, sys, time
 from pathlib import Path
 import torch
 from experiments.common.rollouts import pack_rollouts, forward_kl
-from experiments.common.loss import backward_opd, backward_reference
+from experiments.common.loss import backward_opsd, backward_reference
 from experiments.common.native import NativeForward, collect_sampled_rollout
 from experiments.common.gradient_diagnostics import ComponentSnapshot
+from experiments.opsd_sampled_preservation.schedule import shallow_jobs_for_update
 import recovery
 from native_recurrent import NativeReadout, prepare_data
 from train import seed_all, batch_tensors, eval_nll
@@ -95,24 +96,17 @@ def gate(args,cfg,output):
         stress_batches[depth]=(stress,None if state is None else state.detach().cpu())
     opt=bnb.optim.AdamW8bit([p for p in student.parameters() if p.requires_grad],lr=cfg['learning_rate'],weight_decay=.01,betas=(.9,.95),eps=1e-8)
     scaler=torch.amp.GradScaler('cuda',init_scale=128);torch.cuda.reset_peak_memory_stats();updates=0
-    for depth in depths:
-        for _ in range(2):
-            opt.zero_grad(set_to_none=True)
-            if cfg['teacher_mode']!='sft-only':
-                stress,state=stress_batches[depth];target=teacher_target(teacher,stress,state,4,amp)
-                backward_opd(fwd,target,stress,depth=depth,denominator=1,backward=lambda l:scaler.scale(l).backward(),replay_context=state,autocast=amp)
-            probe=ComponentSnapshot([p for p in student.parameters() if p.requires_grad],output/'gate-gradient-probe') if cfg['student_depths'] else None
-            if probe:probe.capture()
-            if cfg['preservation_weight']:
-                stress,state=stress_batches[4];target=teacher_target(teacher,stress,state,4,amp)
-                backward_opd(fwd,target,stress,depth=4,denominator=1,backward=lambda l:scaler.scale(cfg['preservation_weight']*l).backward(),replay_context=state,autocast=amp)
-            if cfg['reference_ce_weight']:
-                x,y=batch_tensors([max(enc['train'],key=lambda p:len(p[0]))],'cuda',eos)
-                backward_reference(fwd,x,y,depth=4,denominator=int((y!=-100).sum()),weight=cfg['reference_ce_weight'],backward=lambda l:scaler.scale(l).backward(),autocast=amp)
-            if probe:
-                gate_diagnostics=probe.combine(scaler.get_scale());probe.close()
-            scaler.unscale_(opt);norm=torch.nn.utils.clip_grad_norm_(student.parameters(),1.);assert torch.isfinite(norm) and norm>0
-            scale=scaler.get_scale();scaler.step(opt);scaler.update();assert scaler.get_scale()>=scale;updates+=1
+    for _ in range(2):
+        opt.zero_grad(set_to_none=True)
+        for depth in depths:
+            stress,state=stress_batches[depth];target=teacher_target(teacher,stress,state,4,amp)
+            backward_opsd(fwd,target,stress,depth=depth,denominator=len(depths),backward=lambda l:scaler.scale(l).backward(),replay_context=state,autocast=amp)
+        probe=ComponentSnapshot([p for p in student.parameters() if p.requires_grad],output/'gate-gradient-probe');probe.capture()
+        stress,state=stress_batches[4];target=teacher_target(teacher,stress,state,4,amp)
+        backward_opsd(fwd,target,stress,depth=4,denominator=1,backward=lambda l:scaler.scale(l).backward(),replay_context=state,autocast=amp)
+        gate_diagnostics=probe.combine(scaler.get_scale());probe.close()
+        scaler.unscale_(opt);norm=torch.nn.utils.clip_grad_norm_(student.parameters(),1.);assert torch.isfinite(norm) and norm>0
+        scale=scaler.get_scale();scaler.step(opt);scaler.update();assert scaler.get_scale()>=scale;updates+=1
     assert student.frozen_digest()==frozen
     if cfg['teacher_mode']=='frozen':assert all_digest(teacher)==before
     else:assert teacher is student and all_digest(teacher)!=before
@@ -125,8 +119,11 @@ def run(args,cfg,out):
     from transformers import AutoTokenizer
     assert cfg['seed']==42 and cfg['maximum_depth']==4 and set(cfg['student_depths'])<={1,2,3}
     assert cfg['teacher_mode'] in ('frozen','sft-only')
-    assert cfg['student_depths'] in ([1], [])
-    assert cfg['opd_weight']==1.0
+    assert cfg['student_depths']==[1,2,3] and cfg['teacher_mode']=='frozen'
+    assert cfg['student_depth_sampling']=='uniform-once-per-optimizer-update'
+    assert cfg['shallow_loss_weights']=={'1':1/3,'2':1/3,'3':1/3}
+    assert cfg['preservation_weight']==1 and cfg['reference_ce_weight']==0
+    assert cfg['opsd_weight']==1.0
     assert not cfg['teacher_privileged_context']
     assert cfg['optimizer']=='adamw8' and cfg['eval_depths']==[1,2,4]
     gate_record=json.load(open(args.gate))
@@ -168,7 +165,7 @@ def run(args,cfg,out):
     tracker=None
     if os.environ.get('WANDB_API_KEY'):
         import wandb
-        tracker=wandb.init(project=os.environ.get('WANDB_PROJECT', 'depth-opd'),entity=os.environ.get('WANDB_ENTITY'),group='GSM8K/OPD-preservation-s42',name=cfg['run_id'],config=cfg,id=progress.get('wandb_id'),resume='allow')
+        tracker=wandb.init(project=os.environ.get('WANDB_PROJECT', 'looped-opsd'),entity=os.environ.get('WANDB_ENTITY'),group='GSM8K/OPSD-sampled123-preservation',name=cfg['run_id'],config=cfg,id=progress.get('wandb_id'),resume='allow')
         tracker.define_metric('step');tracker.define_metric('*',step_metric='step')
         progress['wandb_id']=tracker.id;(out/'tracking.json').write_text(json.dumps({'run_id':tracker.id})+'\n')
     def emit(event):
@@ -205,15 +202,16 @@ def run(args,cfg,out):
             step=progress['step']+1
             # All trajectories are drawn before an update; no optimizer change
             # or reference supervision occurs between sampling and replay.
-            depths=[rng.choice(cfg['student_depths']) for i in indices] if cfg['student_depths'] else []
-            rollouts=[collect_sampled_rollout(student,rows['train'][i],tokenizer,d,eos,deadline=deadline,should_stop=lambda:stopped[0]) for i,d in zip(indices,depths)]
+            shallow_jobs=shallow_jobs_for_update(indices,rng,cfg['student_depths'])
+            depths=[d for i,d in shallow_jobs]
+            rollouts=[collect_sampled_rollout(student,rows['train'][i],tokenizer,d,eos,deadline=deadline,should_stop=lambda:stopped[0]) for i,d in shallow_jobs]
             deep_rollouts=[collect_sampled_rollout(student,rows['train'][i],tokenizer,4,eos,deadline=deadline,should_stop=lambda:stopped[0]) for i in indices] if cfg['preservation_weight'] else []
             opt.zero_grad(set_to_none=True);student.train()
             lr=cfg['learning_rate']*(step/8 if step<=8 else .5*(1+math.cos(math.pi*(step-8)/56)))
             for g in opt.param_groups:g['lr']=lr
             totals={'kl_sequence_mean_sum':0.,'kl_sum':0.,'rollout_tokens':0,'rollout_examples':0,'reference_ce_sum':0.,'reference_tokens':0}
             refden=sum(sum(y!=-100 for y in enc['train'][i][1]) for i in indices)
-            preservation_sum=0.;preservation_tokens=0
+            preservation_sum=0.;preservation_tokens=0;depth_kl_sums={1:0.,2:0.,3:0.}
             probe = bool(rollouts and (deep_rollouts or cfg['reference_ce_weight']) and
                          (step == 1 or step % cfg['gradient_cosine_every'] == 0))
             snapshot = ComponentSnapshot([p for p in student.parameters() if p.requires_grad], scratch) if probe else None
@@ -221,21 +219,21 @@ def run(args,cfg,out):
             try:
                 # Full-batch shallow component first. All rollouts were sampled
                 # before either loss; weights remain unchanged until one step.
-                for j,i in enumerate(indices):
-                    if not rollouts:continue
-                    r=rollouts[j];depth=depths[j]
+                for j,(i,depth) in enumerate(shallow_jobs):
+                    r=rollouts[j]
                     packed=pack_rollouts([r.prefix],[r.completion],eos=eos,pad=eos,device='cuda')
                     target=teacher_target(teacher,packed,r.initial_state,4,amp)
-                    stats=backward_opd(fwd,target,packed,depth=depth,denominator=len(indices),backward=lambda l:scaler.scale(l).backward(),replay_context=r.initial_state,autocast=amp)
+                    stats=backward_opsd(fwd,target,packed,depth=depth,denominator=len(shallow_jobs),backward=lambda l:scaler.scale(l).backward(),replay_context=r.initial_state,autocast=amp)
                     for k,v in stats.items():totals[k]+=v
-                    rollog.write(json.dumps({'step':step,'question_sha256':rows['train'][i]['question_sha256'],'completion_tokens':r.completion,'ended':r.ended,'student_depth':depth,'family':'shallow_opd'})+'\n')
+                    depth_kl_sums[depth]+=stats['kl_sequence_mean_sum']
+                    rollog.write(json.dumps({'step':step,'question_sha256':rows['train'][i]['question_sha256'],'completion_tokens':r.completion,'ended':r.ended,'student_depth':depth,'family':'shallow_opsd'})+'\n')
                     del target,packed
                 if snapshot:snapshot.capture()
                 for j,i in enumerate(indices):
                     if deep_rollouts:
                         r=deep_rollouts[j];packed=pack_rollouts([r.prefix],[r.completion],eos=eos,pad=eos,device='cuda')
                         target=teacher_target(teacher,packed,r.initial_state,4,amp)
-                        stats=backward_opd(fwd,target,packed,depth=4,denominator=len(indices),backward=lambda l:scaler.scale(cfg['preservation_weight']*l).backward(),replay_context=r.initial_state,autocast=amp)
+                        stats=backward_opsd(fwd,target,packed,depth=4,denominator=len(indices),backward=lambda l:scaler.scale(cfg['preservation_weight']*l).backward(),replay_context=r.initial_state,autocast=amp)
                         preservation_sum+=stats['kl_sequence_mean_sum'];preservation_tokens+=stats['rollout_tokens']
                         rollog.write(json.dumps({'step':step,'question_sha256':rows['train'][i]['question_sha256'],'completion_tokens':r.completion,'ended':r.ended,'student_depth':4,'family':'preservation'})+'\n');del target,packed
                     if cfg['reference_ce_weight']:
@@ -250,7 +248,7 @@ def run(args,cfg,out):
             oldscale=scaler.get_scale();scaler.step(opt);scaler.update()
             if scaler.get_scale()<oldscale:raise FloatingPointError('Skipped update: hold for inspection, do not silently change exposure')
             progress['step']=step;cursor.advance(len(indices))
-            emit({'event':'train','step':step,'opd_loss':totals['kl_sequence_mean_sum']/len(indices),'reference_ce':totals['reference_ce_sum']/max(1,totals['reference_tokens']),'gradient_norm':float(norm),'gradient_clip_multiplier':min(1.,1./max(float(norm),1e-30)),'lr':lr,'eos_rate':sum(r.ended for r in rollouts)/max(1,len(rollouts)),'mean_rollout_length':totals['rollout_tokens']/len(indices),'peak_gpu_gib':torch.cuda.max_memory_allocated()/2**30,'shallow_kl':totals['kl_sequence_mean_sum']/len(indices),'preservation_kl':preservation_sum/len(indices),'weighted_preservation_kl':cfg['preservation_weight']*preservation_sum/len(indices),'total_objective':totals['kl_sequence_mean_sum']/len(indices)+cfg['preservation_weight']*preservation_sum/len(indices)+cfg['reference_ce_weight']*totals['reference_ce_sum']/max(1,totals['reference_tokens']),'preservation_eos_rate':sum(r.ended for r in deep_rollouts)/len(deep_rollouts) if deep_rollouts else None,'preservation_mean_rollout_length':preservation_tokens/len(deep_rollouts) if deep_rollouts else None,'anchor_kind':'KL4' if cfg['preservation_weight'] else 'CE4',**diagnostics,'preservation_tokens':preservation_tokens,'depth_counts':{str(d):depths.count(d) for d in [1,2,3]},**totals})
+            emit({'event':'train','step':step,'opsd_loss':totals['kl_sequence_mean_sum']/len(shallow_jobs),'reference_ce':totals['reference_ce_sum']/max(1,totals['reference_tokens']),'gradient_norm':float(norm),'gradient_clip_multiplier':min(1.,1./max(float(norm),1e-30)),'lr':lr,'eos_rate':sum(r.ended for r in rollouts)/max(1,len(rollouts)),'mean_rollout_length':totals['rollout_tokens']/len(shallow_jobs),'peak_gpu_gib':torch.cuda.max_memory_allocated()/2**30,'shallow_kl':totals['kl_sequence_mean_sum']/len(shallow_jobs),'preservation_kl':preservation_sum/len(indices),'weighted_preservation_kl':cfg['preservation_weight']*preservation_sum/len(indices),'total_objective':totals['kl_sequence_mean_sum']/len(shallow_jobs)+cfg['preservation_weight']*preservation_sum/len(indices)+cfg['reference_ce_weight']*totals['reference_ce_sum']/max(1,totals['reference_tokens']),'preservation_eos_rate':sum(r.ended for r in deep_rollouts)/len(deep_rollouts) if deep_rollouts else None,'preservation_mean_rollout_length':preservation_tokens/len(deep_rollouts) if deep_rollouts else None,'shallow_kl_d1':depth_kl_sums[1]/len(indices) if depths[0]==1 else None,'shallow_kl_d2':depth_kl_sums[2]/len(indices) if depths[0]==2 else None,'shallow_kl_d3':depth_kl_sums[3]/len(indices) if depths[0]==3 else None,'sampled_student_depth':depths[0],'anchor_kind':'KL4',**diagnostics,'preservation_tokens':preservation_tokens,'depth_counts':{str(d):depths.count(d) for d in [1,2,3]},**totals})
             del rollouts,deep_rollouts;opt.zero_grad(set_to_none=True)
             if step%8==0:save()
             if step==64:

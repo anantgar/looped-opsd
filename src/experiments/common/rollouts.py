@@ -92,7 +92,7 @@ def backward_microbatch(forward:Callable, gold_inputs, gold_targets,
             if kl.numel()!=sum(rollout.response_lengths):raise ValueError('Wrong prediction shift/count')
             sequence_means=torch.stack([values.mean() for values in kl.split(rollout.response_lengths)])
             kd=kd_weight*sequence_means.sum()/rollout_example_denominator
-        if not torch.isfinite(kd):raise FloatingPointError('Nonfinite OPD loss')
+        if not torch.isfinite(kd):raise FloatingPointError('Nonfinite OPSD loss')
         stats={'reference_ce_sum':ce_value,'reference_tokens':int(positions.sum()),
                'rollout_tokens':kl.numel(),'rollout_examples':len(rollout.response_lengths),
                'kl_sum':float(kl.detach().sum()),'kl_sequence_mean_sum':float(sequence_means.detach().sum())}

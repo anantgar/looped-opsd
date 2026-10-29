@@ -1,11 +1,11 @@
-"""Frozen-teacher full-vocabulary OPD; reference CE is optional and separate."""
+"""Frozen-teacher full-vocabulary OPSD; reference CE is optional and separate."""
 from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 from experiments.common.rollouts import forward_kl
 
 
-def backward_opd(student, teacher_target, rollout, *, depth, denominator,
+def backward_opsd(student, teacher_target, rollout, *, depth, denominator,
                  backward, replay_context=None, autocast=nullcontext):
     if denominator < len(rollout.response_lengths):
         raise ValueError('Invalid effective batch denominator')
@@ -21,7 +21,7 @@ def backward_opd(student, teacher_target, rollout, *, depth, denominator,
             means = torch.stack([part.mean() for part in kl.split(rollout.response_lengths)])
             loss = means.sum() / denominator
         if not torch.isfinite(loss):
-            raise FloatingPointError('Nonfinite OPD')
+            raise FloatingPointError('Nonfinite OPSD')
         stats = {'kl_sum': float(kl.detach().sum()),
                  'kl_sequence_mean_sum': float(means.detach().sum()),
                  'rollout_tokens': kl.numel(), 'rollout_examples': len(means)}

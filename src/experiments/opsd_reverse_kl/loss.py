@@ -1,4 +1,4 @@
-"""Dense reverse KL for shallow OPD; retain forward KL for the D4 anchor."""
+"""Dense reverse KL for shallow OPSD; retain forward KL for the D4 anchor."""
 
 from contextlib import nullcontext
 import time
@@ -26,7 +26,7 @@ def _sync():
         torch.cuda.synchronize()
 
 
-def backward_opd(
+def backward_opsd(
     student,
     teacher_target,
     rollout,

@@ -210,7 +210,7 @@ def run(cfg, args):
     if not args.profile_only and os.environ.get('WANDB_MODE', 'offline') != 'disabled':
         import wandb
         tracking = progress.get('tracking')
-        tracker = wandb.init(project=os.environ.get('WANDB_PROJECT', 'depth-opd'), entity=os.environ.get('WANDB_ENTITY'),
+        tracker = wandb.init(project=os.environ.get('WANDB_PROJECT', 'looped-opsd'), entity=os.environ.get('WANDB_ENTITY'),
                              id=tracking['run_id'] if tracking else None,
                              resume='must' if tracking and os.environ.get('WANDB_MODE')=='online' else None,
                              name=out.name, config={**cfg, **metadata}, dir=str(out),
