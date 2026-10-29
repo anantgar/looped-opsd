@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env*
+wandb/
+outputs/
+models/
+data/
+*.pt
+*.bin
+*.safetensors

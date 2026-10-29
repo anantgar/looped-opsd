@@ -1,0 +1,6 @@
+torch==2.7.0
+transformers==4.55.0
+bitsandbytes==0.46.1
+numpy>=1.26,<3
+einops>=0.8,<0.9
+wandb>=0.21,<1
